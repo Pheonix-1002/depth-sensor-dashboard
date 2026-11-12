@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Fused Depth Sensor (BLE)</title>
+<style>
+  body { font-family: sans-serif; background:#111; color:#eee; text-align:center; padding:16px; margin:0; }
+  h1 { font-size: 1.25em; margin: 0 0 12px; }
+  .value { font-size: 3em; font-weight: bold; margin: 14px 0 4px; }
+  .ci { font-size: 1.05em; color:#9cf; min-height: 1.4em; }
+  .detail { font-size: 0.88em; color:#aaa; margin-top: 6px; line-height: 1.7; }
+  .warn { color:#f66; font-size: 0.88em; margin-top: 6px; min-height: 1.2em; }
+  .row { margin: 12px 0; }
+  button { font-size: 0.95em; padding: 9px 14px; margin: 4px; border-radius: 8px; border: 1px solid #555; background:#222; color:#eee; cursor:pointer; }
+  button:disabled { opacity: 0.35; cursor: default; }
+  button.active { background:#2a6; border-color:#2a6; color:#fff; }
+  #connectBtn { background:#36a; border-color:#36a; }
+  #measureBtn { background:#36a; border-color:#36a; }
+  #recalBtn { background:#654; border-color:#654; }
+  hr { border:0; border-top:1px solid #333; margin:18px 0; }
+  .small { font-size: 0.82em; color:#999; }
+  .mono { font-family: monospace; color:#ccc; }
+  #status { font-size: 0.9em; margin-top: 4px; }
+  .on { color:#2a6; } .off { color:#f66; } .mid { color:#fa0; }
+</style>
+</head>
+<body>
+  <h1>ESP32 Fused Depth Sensor</h1>
+
+  <div class="row">
+    <button id="connectBtn" onclick="toggleConnection()">Connect</button>
+    <div id="status" class="off">Not connected</div>
+    <div class="small" id="supportMsg"></div>
+  </div>
+
+  <div class="row">
+    <button id="fusedBtn" onclick="setMode(1)" disabled>Fused (Model+MPU)</button>
+    <button id="rawBtn"   onclick="setMode(0)" disabled>Raw</button>
+  </div>
+  <div class="row">
+    <button id="contBtn" onclick="setContinuous(1)" disabled>Continuous</button>
+    <button id="onceBtn" onclick="setContinuous(0)" disabled>Once</button>
+    <button id="measureBtn" onclick="measureNow()" disabled>Measure Now</button>
+  </div>
+
+  <div class="value" id="valueOut">--</div>
+  <div class="ci"     id="ciOut"></div>
+  <div class="detail" id="detailOut"></div>
+  <div class="warn"   id="warnOut"></div>
+
+  <hr>
+  <div class="small">
+    <b>Auto-Axis Calibration</b>
+    <div class="mono" id="axisLive" style="margin-top:8px; font-size:1.1em;"></div>
+  </div>
+
+  <hr>
+  <div class="row">
+    <button id="recalBtn" onclick="recalibrate()" disabled>Recalibrate MPU (keep still!)</button>
+  </div>
+  <div class="small" id="mpuState"></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// BLE (Nordic UART Service) - must match the ESP32 firmware
+// ---------------------------------------------------------------------------
+const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // page -> ESP32 (write)
+const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // ESP32 -> page (notify)
+
+let device = null, rxChar = null, txChar = null;
+let buf = '';
+let connected = false;
+let lastState = null;
+
+const $ = id => document.getElementById(id);
+
+function setStatus(text, cls) {
+  const s = $('status');
+  s.textContent = text;
+  s.className = cls;
+}
+
+function setControlsEnabled(on) {
+  ['fusedBtn', 'rawBtn', 'contBtn', 'onceBtn', 'recalBtn'].forEach(id => $(id).disabled = !on);
+  $('measureBtn').disabled = !on || (lastState && lastState.continuous);
+}
+
+if (!('bluetooth' in navigator)) {
+  $('connectBtn').disabled = true;
+  $('supportMsg').textContent =
+    'Web Bluetooth is not supported in this browser. Use Chrome on Android or desktop (on iPhone, try the Bluefy app).';
+}
+
+async function toggleConnection() {
+  if (connected && device && device.gatt.connected) {
+    device.gatt.disconnect();
+    return;
+  }
+  await connectBLE();
+}
+
+async function connectBLE() {
+  try {
+    setStatus('Choose a device...', 'mid');
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    setStatus('Connecting...', 'mid');
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SVC);
+    rxChar = await service.getCharacteristic(RX);
+    txChar = await service.getCharacteristic(TX);
+
+    buf = '';
+    txChar.addEventListener('characteristicvaluechanged', onNotify);
+    await txChar.startNotifications();
+
+    connected = true;
+    $('connectBtn').textContent = 'Disconnect';
+    setStatus('Connected to ' + (device.name || 'ESP32'), 'on');
+    setControlsEnabled(true);
+
+    // Ask for a first reading so the page fills in right away
+    await send('measure');
+  } catch (e) {
+    console.error(e);
+    connected = false;
+    setStatus(e && e.name === 'NotFoundError' ? 'No device selected' : 'Connection failed: ' + (e.message || e), 'off');
+    $('connectBtn').textContent = 'Connect';
+    setControlsEnabled(false);
+  }
+}
+
+function onDisconnected() {
+  connected = false;
+  rxChar = txChar = null;
+  $('connectBtn').textContent = 'Connect';
+  setStatus('Disconnected', 'off');
+  setControlsEnabled(false);
+}
+
+function onNotify(e) {
+  buf += new TextDecoder().decode(e.target.value);
+  let i;
+  while ((i = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    if (!line) continue;
+    try { render(normalize(JSON.parse(line))); } catch (err) { console.warn('Bad packet', line); }
+  }
+}
+
+async function send(cmd) {
+  if (!rxChar) return;
+  try {
+    await rxChar.writeValue(new TextEncoder().encode(cmd));
+  } catch (e) {
+    console.error('Write failed', e);
+  }
+}
+
+// Map the short keys sent by the ESP32 to the names render() uses
+function normalize(p) {
+  return {
+    showFused:  !!p.f,
+    continuous: !!p.c,
+    axisName:   p.ax,
+    axisLocked: !!p.lk,
+    mpuReady:   !!p.mr,
+    valid:      !!p.v,
+    missed:     !!p.ms,
+    raw:        p.raw,
+    model:      p.mod,
+    lo:         p.lo,
+    hi:         p.hi,
+    fused:      p.fu,
+    mpuPred:    (p.mp === undefined ? null : p.mp),
+    mpuUsed:    p.mu,
+    source:     p.src,
+    outOfRange: !!p.oor
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+function setMode(f)       { send('mode:' + (f ? 1 : 0)); }
+function setContinuous(c) { send('cont:' + (c ? 1 : 0)); }
+let measureBusy = false;
+function measureNow() {
+  if (measureBusy) return;
+  measureBusy = true;
+  send('measure');
+  setTimeout(() => { measureBusy = false; }, 500);
+}
+async function recalibrate() {
+  const b = $('recalBtn');
+  b.disabled = true; b.textContent = 'Calibrating...';
+  await send('recal');
+  // Calibration takes about a second on the ESP32
+  setTimeout(() => {
+    b.textContent = 'Recalibrate MPU (keep still!)';
+    b.disabled = !connected;
+  }, 2500);
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+function render(d) {
+  lastState = d;
+
+  $('fusedBtn').classList.toggle('active', d.showFused);
+  $('rawBtn').classList.toggle('active', !d.showFused);
+  $('contBtn').classList.toggle('active', d.continuous);
+  $('onceBtn').classList.toggle('active', !d.continuous);
+  $('measureBtn').disabled = !connected || d.continuous;
+
+  const aOut = $('axisLive');
+  if (d.axisLocked) {
+    aOut.innerHTML = 'Beam Axis: <span style="color:#2a6">' + d.axisName + ' (Locked)</span>';
+  } else {
+    aOut.innerHTML = 'Beam Axis: <span style="color:#fa0">' + d.axisName + ' (Learning... Move the board)</span>';
+  }
+
+  $('mpuState').textContent = d.mpuReady ? 'MPU OK' : 'MPU6050 NOT detected';
+
+  const vOut = $('valueOut');
+  const cOut = $('ciOut');
+  const dOut = $('detailOut');
+  const wOut = $('warnOut');
+
+  if (!d.valid) {
+    vOut.textContent = '--';
+    cOut.textContent = '';
+    dOut.textContent = '';
+    wOut.textContent = 'Waiting for an echo from the HC-SR04...';
+    return;
+  }
+
+  if (d.showFused) {
+    vOut.textContent = d.fused.toFixed(2) + ' cm';
+    cOut.textContent = 'Model 95% CI: [' + d.lo.toFixed(2) + ', ' + d.hi.toFixed(2) + '] cm';
+
+    let html = 'Source: <b>' + d.source + '</b><br>';
+    html += 'Model estimate: ' + d.model.toFixed(2) + ' cm<br>';
+    if (d.mpuPred === null)
+      html += 'MPU prediction: &mdash;<br>';
+    else
+      html += 'MPU prediction: ' + d.mpuPred.toFixed(2) + ' cm (&#916; ' + (d.mpuUsed >= 0 ? '+' : '') + d.mpuUsed.toFixed(2) + ' cm)<br>';
+    html += 'Raw echo: ' + d.raw.toFixed(2) + ' cm';
+    dOut.innerHTML = html;
+  } else {
+    vOut.textContent = d.raw.toFixed(2) + ' cm';
+    cOut.textContent = '';
+    dOut.textContent = '';
+  }
+
+  let warn = '';
+  if (d.outOfRange) warn += 'Warning: outside training range. ';
+  if (d.missed) warn += 'Last echo timed out.';
+  wOut.textContent = warn;
+}
+</script>
+</body>
+</html>
