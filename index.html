@@ -188,7 +188,13 @@ function normalize(p) {
 // ---------------------------------------------------------------------------
 function setMode(f)       { send('mode:' + (f ? 1 : 0)); }
 function setContinuous(c) { send('cont:' + (c ? 1 : 0)); }
-function measureNow()     { send('measure'); }
+let measureBusy = false;
+function measureNow() {
+  if (measureBusy) return;
+  measureBusy = true;
+  send('measure');
+  setTimeout(() => { measureBusy = false; }, 500);
+}
 async function recalibrate() {
   const b = $('recalBtn');
   b.disabled = true; b.textContent = 'Calibrating...';
