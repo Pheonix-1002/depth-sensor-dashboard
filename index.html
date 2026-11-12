@@ -60,6 +60,8 @@
     <button id="recalBtn" onclick="recalibrate()" disabled>Recalibrate MPU (keep still!)</button>
   </div>
   <div class="small" id="mpuState"></div>
+  <!-- NEW: MPU die temperature readout -->
+  <div class="small" id="mpuTempState" style="margin-top:4px;"></div>
 
   <div id="otaBox" style="display:none">
     <hr>
@@ -77,8 +79,8 @@
 // BLE (Nordic UART Service) - must match the ESP32 firmware
 // ---------------------------------------------------------------------------
 const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // page -> ESP32 (write)
-const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // ESP32 -> page (notify)
+const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const OTA_CTRL = '6e400004-b5a3-f393-e0a9-e50e24dcca9e';
 const OTA_DATA = '6e400005-b5a3-f393-e0a9-e50e24dcca9e';
 
@@ -130,7 +132,6 @@ async function connectBLE() {
     txChar.addEventListener('characteristicvaluechanged', onNotify);
     await txChar.startNotifications();
 
-    // Optional OTA characteristics (older firmware won't have them)
     try {
       otaCtrl = await service.getCharacteristic(OTA_CTRL);
       otaData = await service.getCharacteristic(OTA_DATA);
@@ -148,7 +149,6 @@ async function connectBLE() {
     setStatus('Connected to ' + (device.name || 'ESP32'), 'on');
     setControlsEnabled(true);
 
-    // Ask for a first reading so the page fills in right away
     await send('measure');
   } catch (e) {
     console.error(e);
@@ -206,7 +206,8 @@ function normalize(p) {
     mpuPred:    (p.mp === undefined ? null : p.mp),
     mpuUsed:    p.mu,
     source:     p.src,
-    outOfRange: !!p.oor
+    outOfRange: !!p.oor,
+    mpuTemp:    (p.tp === undefined ? null : p.tp)   // NEW
   };
 }
 
@@ -226,13 +227,11 @@ async function recalibrate() {
   const b = $('recalBtn');
   b.disabled = true; b.textContent = 'Calibrating...';
   await send('recal');
-  // Calibration takes about a second on the ESP32
   setTimeout(() => {
     b.textContent = 'Recalibrate MPU (keep still!)';
     b.disabled = !connected;
   }, 2500);
 }
-
 
 // ---------------------------------------------------------------------------
 // Firmware update over BLE
@@ -358,6 +357,10 @@ function render(d) {
   }
 
   $('mpuState').textContent = d.mpuReady ? 'MPU OK' : 'MPU6050 NOT detected';
+  // NEW: MPU die temperature
+  $('mpuTempState').textContent = (d.mpuReady && d.mpuTemp !== null && d.mpuTemp !== undefined)
+    ? 'MPU temperature: ' + Number(d.mpuTemp).toFixed(1) + ' °C'
+    : '';
 
   const vOut = $('valueOut');
   const cOut = $('ciOut');
