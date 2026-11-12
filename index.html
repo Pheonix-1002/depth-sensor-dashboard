@@ -61,6 +61,17 @@
   </div>
   <div class="small" id="mpuState"></div>
 
+  <div id="otaBox" style="display:none">
+    <hr>
+    <div class="small"><b>Firmware update (over Bluetooth)</b></div>
+    <div class="row">
+      <input type="file" id="fwFile" accept=".bin">
+      <button id="otaBtn" onclick="uploadFirmware()" disabled>Upload firmware</button>
+    </div>
+    <progress id="otaBar" value="0" max="100" style="width:80%"></progress>
+    <div class="small" id="otaMsg">Use the <span class="mono">.ino.bin</span> file from Sketch &rarr; Export Compiled Binary. Keep this page open and the phone near the board.</div>
+  </div>
+
 <script>
 // ---------------------------------------------------------------------------
 // BLE (Nordic UART Service) - must match the ESP32 firmware
@@ -68,8 +79,10 @@
 const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // page -> ESP32 (write)
 const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // ESP32 -> page (notify)
+const OTA_CTRL = '6e400004-b5a3-f393-e0a9-e50e24dcca9e';
+const OTA_DATA = '6e400005-b5a3-f393-e0a9-e50e24dcca9e';
 
-let device = null, rxChar = null, txChar = null;
+let device = null, rxChar = null, txChar = null, otaCtrl = null, otaData = null, otaRunning = false;
 let buf = '';
 let connected = false;
 let lastState = null;
@@ -117,6 +130,19 @@ async function connectBLE() {
     txChar.addEventListener('characteristicvaluechanged', onNotify);
     await txChar.startNotifications();
 
+    // Optional OTA characteristics (older firmware won't have them)
+    try {
+      otaCtrl = await service.getCharacteristic(OTA_CTRL);
+      otaData = await service.getCharacteristic(OTA_DATA);
+      otaCtrl.addEventListener('characteristicvaluechanged', onOtaMsg);
+      await otaCtrl.startNotifications();
+      $('otaBox').style.display = 'block';
+      $('otaBtn').disabled = false;
+    } catch (_) {
+      otaCtrl = otaData = null;
+      $('otaBox').style.display = 'none';
+    }
+
     connected = true;
     $('connectBtn').textContent = 'Disconnect';
     setStatus('Connected to ' + (device.name || 'ESP32'), 'on');
@@ -135,7 +161,8 @@ async function connectBLE() {
 
 function onDisconnected() {
   connected = false;
-  rxChar = txChar = null;
+  rxChar = txChar = otaCtrl = otaData = null;
+  $('otaBtn').disabled = true;
   $('connectBtn').textContent = 'Connect';
   setStatus('Disconnected', 'off');
   setControlsEnabled(false);
@@ -204,6 +231,111 @@ async function recalibrate() {
     b.textContent = 'Recalibrate MPU (keep still!)';
     b.disabled = !connected;
   }, 2500);
+}
+
+
+// ---------------------------------------------------------------------------
+// Firmware update over BLE
+// ---------------------------------------------------------------------------
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+const otaListeners = [];
+function onOtaMsg(e) {
+  const m = new TextDecoder().decode(e.target.value);
+  otaListeners.slice().forEach(f => f(m));
+}
+function otaWait(pred, ms) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const f = m => {
+      if (m.startsWith('err:')) { done(); reject(new Error('Device error: ' + m.slice(4))); }
+      else if (pred(m)) { done(); resolve(m); }
+    };
+    const done = () => {
+      clearTimeout(timer);
+      const i = otaListeners.indexOf(f);
+      if (i >= 0) otaListeners.splice(i, 1);
+    };
+    timer = setTimeout(() => { done(); reject(new Error('Timed out waiting for the device')); }, ms);
+    otaListeners.push(f);
+  });
+}
+const enc = s => new TextEncoder().encode(s);
+function setOta(msg) { $('otaMsg').textContent = msg; }
+
+async function uploadFirmware() {
+  if (otaRunning || !otaCtrl || !otaData) return;
+  const file = $('fwFile').files[0];
+  if (!file) { setOta('Choose a .bin file first.'); return; }
+  if (/bootloader|partitions|merged/i.test(file.name)) {
+    setOta('Wrong file. Use the plain .ino.bin app file, not bootloader, partitions or merged.');
+    return;
+  }
+  const pwd = prompt('Firmware update password:');
+  if (!pwd) return;
+
+  const data = new Uint8Array(await file.arrayBuffer());
+  if (data[0] !== 0xE9) { setOta('This does not look like an ESP32 firmware image.'); return; }
+  if (!confirm('Upload ' + file.name + ' (' + data.length + ' bytes)? Do not disconnect or close this page until it finishes.')) return;
+
+  otaRunning = true;
+  $('otaBtn').disabled = true;
+  $('otaBar').value = 0;
+  const CHUNK = 240, WINDOW = 4096;
+  const t0 = Date.now();
+
+  try {
+    const crc = crc32(data);
+
+    setOta('Preparing the device (erasing flash, this can take 10-20 seconds)...');
+    const ready = otaWait(m => m === 'ready', 60000);
+    ready.catch(() => {});
+    await otaCtrl.writeValue(enc('begin:' + data.length + ':' + pwd));
+    await ready;
+
+    let offset = 0;
+    while (offset < data.length) {
+      const winEnd = Math.min(offset + WINDOW, data.length);
+      const ack = otaWait(m => m.startsWith('ack:') && Number(m.slice(4)) >= winEnd, 15000);
+      ack.catch(() => {});
+      while (offset < winEnd) {
+        const n = Math.min(CHUNK, winEnd - offset);
+        await otaData.writeValueWithoutResponse(data.subarray(offset, offset + n));
+        offset += n;
+      }
+      await ack;
+      $('otaBar').value = Math.round(offset * 100 / data.length);
+      const secs = (Date.now() - t0) / 1000;
+      setOta('Uploading... ' + $('otaBar').value + '% (' + (offset / 1024 / Math.max(secs, 0.1)).toFixed(1) + ' KB/s)');
+    }
+
+    setOta('Verifying and installing...');
+    const fin = otaWait(m => m === 'done', 20000);
+    fin.catch(() => {});
+    await otaCtrl.writeValue(enc('end:' + crc));
+    await fin;
+    setOta('Update installed. The board is rebooting. Wait a few seconds, then tap Connect again.');
+  } catch (e) {
+    console.error(e);
+    setOta('Update failed: ' + (e.message || e) + '. The old firmware is still in place.');
+    try { await otaCtrl.writeValue(enc('abort')); } catch (_) {}
+  } finally {
+    otaRunning = false;
+    $('otaBtn').disabled = !connected || !otaCtrl;
+  }
 }
 
 // ---------------------------------------------------------------------------
